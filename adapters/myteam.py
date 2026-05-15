@@ -25,8 +25,19 @@ class Engine(Adapter):
         self.beta = float(model_params["beta"])
         self.pi_min = float(model_params["pi_min"])
         self.pi_max = float(model_params["pi_max"])
+        self.eps = np.finfo(np.float64).eps
+        self.precision_log_span = np.log(self.pi_max / self.pi_min)
+        self.optim_steps = 2 * self.N
+        self.optim_lr = self.precision_log_span / np.sqrt(self.N)
+        self.optim_decay = np.exp(np.log(0.5) / max(self.optim_steps, 1))
         self.pattern_norms = np.linalg.norm(self.X, axis=1)
-        self.pattern_norms[self.pattern_norms < 1e-12] = 1.0
+        self.pattern_norms[self.pattern_norms < self.eps] = 1.0
+        normalised_x = self.X / self.pattern_norms[:, None]
+        pairwise_cos = normalised_x @ normalised_x.T
+        np.fill_diagonal(pairwise_cos, -np.inf)
+        nearest_neighbour_cos = float(np.max(pairwise_cos))
+        self.near_pattern_cos = 0.5 * (1.0 + nearest_neighbour_cos)
+        self.query_floor = np.median(np.abs(self.X))
         self.spread_profiles = self._build_spread_profiles()
 
     def _rank_patterns(self, q: np.ndarray) -> np.ndarray:
@@ -39,7 +50,7 @@ class Engine(Adapter):
         z = self.beta * (self.X @ pattern)
         z = z - z.max()
         s = np.exp(z)
-        s = s / s.sum()
+        s = s / max(s.sum(), self.eps)
         weighted_x = s[:, None] * self.X
         cov = weighted_x.T @ self.X - np.outer(s @ self.X, s @ self.X)
         h = self.R - self.eta * self.beta * cov
@@ -47,7 +58,7 @@ class Engine(Adapter):
 
     def _condition_number(self, h: np.ndarray, pi: np.ndarray) -> float:
         pi = np.clip(pi, self.pi_min, self.pi_max)
-        pi = pi / (pi.mean() + 1e-12)
+        pi = pi / max(pi.mean(), self.eps)
         d = np.sqrt(pi)
         s = (d[:, None] * h) * d[None, :]
         eigs = np.linalg.eigvalsh(0.5 * (s + s.T))
@@ -58,9 +69,9 @@ class Engine(Adapter):
 
     def _improve_spread_profile(self, h: np.ndarray) -> np.ndarray:
         candidates = [np.ones(self.N)]
-        diag = np.maximum(np.diag(h), 1e-6)
-        row = np.maximum(np.sum(np.abs(h), axis=1), 1e-6)
-        off = np.maximum(row - np.abs(np.diag(h)), 1e-6)
+        diag = np.maximum(np.diag(h), self.eps)
+        row = np.maximum(np.sum(np.abs(h), axis=1), self.eps)
+        off = np.maximum(row - np.abs(np.diag(h)), self.eps)
         candidates.extend([diag, 1.0 / diag, np.sqrt(diag), 1.0 / np.sqrt(diag)])
         candidates.extend([1.0 / row, 1.0 / off])
 
@@ -69,11 +80,11 @@ class Engine(Adapter):
 
         # A short legitimate log-space descent. It is intentionally modest so
         # construction stays fast for larger hidden K values.
-        y = np.log(np.clip(best / (best.mean() + 1e-12), self.pi_min, self.pi_max))
-        lr = 0.35
-        for _ in range(80):
+        y = np.log(np.clip(best / max(best.mean(), self.eps), self.pi_min, self.pi_max))
+        lr = self.optim_lr
+        for _ in range(self.optim_steps):
             pi = np.exp(y)
-            d = np.sqrt(pi / (pi.mean() + 1e-12))
+            d = np.sqrt(pi / max(pi.mean(), self.eps))
             s = (d[:, None] * h) * d[None, :]
             vals, vecs = np.linalg.eigh(0.5 * (s + s.T))
             if vals[0] <= 1e-9:
@@ -82,12 +93,12 @@ class Engine(Adapter):
             y -= lr * grad
             y -= y.mean()
             y = np.clip(y, np.log(self.pi_min), np.log(self.pi_max))
-            lr *= 0.98
+            lr *= self.optim_decay
             score = self._condition_number(h, np.exp(y))
             if score < best_score:
                 best_score = score
                 best = np.exp(y).copy()
-        return np.maximum(best, 1e-6)
+        return np.maximum(best, self.eps)
 
     def _build_spread_profiles(self) -> np.ndarray:
         return np.array([
@@ -98,7 +109,7 @@ class Engine(Adapter):
     def predict_precision(self, corrupted_query: np.ndarray) -> np.ndarray:
         q = np.asarray(corrupted_query, dtype=np.float64).reshape(self.N)
         q_norm = np.linalg.norm(q)
-        if q_norm > 1e-12:
+        if q_norm > self.eps:
             q = q / q_norm
 
         scores = self._rank_patterns(q)
@@ -106,15 +117,15 @@ class Engine(Adapter):
         best = self.X[best_idx]
 
         cosine = float((self.X[best_idx] @ q) / self.pattern_norms[best_idx])
-        if cosine > 0.90:
+        if cosine >= self.near_pattern_cos:
             return self.spread_profiles[best_idx]
 
         # Strong selected-pattern coordinates that are missing or small in the
         # query are exactly where precision can help PCAM recover the attractor.
-        missing_stroke = np.abs(best) / (np.abs(q) + 0.02)
-        missing_stroke /= missing_stroke.mean() + 1e-12
+        missing_stroke = np.abs(best) / (np.abs(q) + self.query_floor)
+        missing_stroke /= max(missing_stroke.mean(), self.eps)
 
         # Deliberately allow the harness to do its own clipping and
         # mean-normalisation. Pre-clipping changes the shape and hurts retrieval.
         pi = 1.0 + (missing_stroke - 1.0)
-        return np.maximum(pi, 1e-6)
+        return np.maximum(pi, self.eps)
