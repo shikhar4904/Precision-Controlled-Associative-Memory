@@ -1,10 +1,3 @@
-"""
-Precision-only PCAM agent.
-
-This adapter respects the frozen-model rule: it never modifies PCAMModel,
-model_params, R, the gradient, or the integrator. It only returns a positive
-64-dimensional precision vector.
-"""
 from __future__ import annotations
 
 from typing import Any
